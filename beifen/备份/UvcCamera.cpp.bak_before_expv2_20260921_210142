@@ -1,0 +1,205 @@
+// ============================================================================
+// UvcCamera.cpp —— UVC 免驱摄像头取图实现（逐行中文注释）
+// ----------------------------------------------------------------------------
+// 【取图方式】
+//   cv::VideoCapture(index, cv::CAP_V4L2)  打开 /dev/videoN
+//   cap_.read(frame)                       取一帧（OpenCV 内部完成 MJPG 解码 + 色彩转换）
+//   不需要厂商 SDK，也不需要手动管理图像缓冲（OpenCV 负责）
+//
+// 【关键顺序】先设 FOURCC 再设分辨率 —— 顺序写反的话帧率经常协商不上
+// 【关键参数】BUFFERSIZE 必须降到 1，否则驱动缓冲会让画面延迟好几帧
+// 【曝光/增益】UVC 没有统一 API，需要时用命令行 v4l2-ctl 调（见文件末尾说明）
+// ============================================================================
+
+#include "uvc/UvcCamera.hpp"
+
+#include <opencv2/opencv.hpp>
+#include <thread>
+#include <cstdio>
+#include <stdexcept>            // std::runtime_error：相机打不开时抛出，让 main 明确报错
+
+#include "function/function.hpp"
+#include "global/Config.hpp"
+
+// ============================================================================
+// 构造函数：只保存引用，不做耗时操作
+// ============================================================================
+UvcCamera::UvcCamera(SerialPort &sp) : sensors::BaseCamera(sp) {
+    // 从 sensors.json 读配置（与海康版本共用同一个配置文件，方便切换）
+    //   注意：cv::FileStorage 取值时若键不存在会抛异常，所以这里逐个兜底
+    if (!J_SENSORS.config_["uvc"].empty()) {
+        J_SENSORS.config_["uvc"]["device"]      >> this->device_index_;   // /dev/videoN
+        J_SENSORS.config_["uvc"]["width"]       >> this->req_width_;      // 请求宽
+        J_SENSORS.config_["uvc"]["height"]      >> this->req_height_;     // 请求高
+        J_SENSORS.config_["uvc"]["fps"]         >> this->req_fps_;        // 请求帧率
+        J_SENSORS.config_["uvc"]["orientation"] >> this->orientation_;    // 朝向修正
+        int mjpg = 1;
+        J_SENSORS.config_["uvc"]["mjpg"]        >> mjpg;
+        this->use_mjpg_ = (mjpg != 0);
+    }
+}
+
+UvcCamera::~UvcCamera() {
+    if (this->opened_) {
+        this->cap_.release();       // 释放摄像头，否则别的程序打开会失败
+    }
+}
+
+// ============================================================================
+// cameraInit()：打开设备 + 配置格式/分辨率/帧率
+// ============================================================================
+void UvcCamera::cameraInit() {
+    // ① 打开 /dev/videoN。
+    //    第二个参数一定要写 cv::CAP_V4L2，否则 OpenCV 可能去试 GStreamer 后端，
+    //    报一些莫名其妙的错。
+    this->cap_.open(this->device_index_, cv::CAP_V4L2);
+    if (!this->cap_.isOpened()) {
+        // 【重要】这里必须抛异常，不能只是 return。
+        //   原来的写法是"打印一行错误就返回"，程序会继续往下跑，取图拿到空 Mat，
+        //   最后在 letterBox 的 cv::resize 里对一个空图崩溃：
+        //       OpenCV error: (-215:Assertion failed) !ssize.empty() in function 'resize'
+        //   抛异常让 main 明确报错退出，用户一眼就知道是相机没接好。
+        printf("\n[UvcCamera] ❌ 打不开 /dev/video%d\n", this->device_index_);
+        printf("  排查步骤：\n");
+        printf("    1) 摄像头是否已在 VMware 里挂给虚拟机？\n");
+        printf("       VMware 菜单 → 虚拟机 → 可移动设备 → 找到摄像头 → 连接(断开与主机连接)\n");
+        printf("    2) 设备号对不对？  执行： v4l2-ctl --list-devices\n");
+        printf("       如果列出的不是 video%d，改 config/json/sensors.json 里的 uvc.device\n", this->device_index_);
+        printf("    3) 有没有被别的程序占用？  同一个摄像头只能被一个程序打开\n");
+        printf("    4) 权限问题：  ls -l /dev/video*   必要时 sudo chmod 666 /dev/video*\n");
+        throw std::runtime_error("UvcCamera: 无法打开摄像头设备");
+    }
+
+    // ② 先设格式再设分辨率 —— 顺序很重要！
+    //    1080p 想跑到 60/120 帧，UVC 必须用 MJPG（YUYV 未压缩带宽根本不够）。
+    //    FOURCC 用 MJPG，OpenCV 会请摄像头内部做 JPEG 解码。
+    if (this->use_mjpg_) {
+        this->cap_.set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('M', 'J', 'P', 'G'));
+    } else {
+        this->cap_.set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('Y', 'U', 'Y', 'V'));
+    }
+
+    // ③ 设置期望的分辨率和帧率
+    //    ★ 建议不要设 1920x1080：一是 UVC 在 1080p 下实际大多只有 30fps，
+    //      二是把整张 1080p 图送进网络，letterBox 的缩放比例和训练时差太多，
+    //      检测精度会掉。这台机器上先用 640x480 起步。
+    this->cap_.set(cv::CAP_PROP_FRAME_WIDTH,  this->req_width_);
+    this->cap_.set(cv::CAP_PROP_FRAME_HEIGHT, this->req_height_);
+    this->cap_.set(cv::CAP_PROP_FPS,          this->req_fps_);
+
+    // ④ 可选：把驱动内部缓冲降到 1~2 帧。
+    //    默认缓冲可能是 4 帧，会导致"画面延迟 4 帧"，对打飞镖是致命的。
+    this->cap_.set(cv::CAP_PROP_BUFFERSIZE, 1);
+
+    // ⑤ 回读实际生效的值 —— 摄像头不一定接受你请求的参数！
+    //    这一步必须打印出来看，否则会出现"我设了 120fps 怎么只有 30"的困惑。
+    int   real_w   = (int)this->cap_.get(cv::CAP_PROP_FRAME_WIDTH);
+    int   real_h   = (int)this->cap_.get(cv::CAP_PROP_FRAME_HEIGHT);
+    double real_fps = this->cap_.get(cv::CAP_PROP_FPS);
+    printf("[UvcCamera] 打开 /dev/video%d 成功\n", this->device_index_);
+    printf("[UvcCamera] 请求 %dx%d @%.0f fps，实际生效 %dx%d @%.1f fps\n",
+           this->req_width_, this->req_height_, (double)this->req_fps_,
+           real_w, real_h, real_fps);
+
+    this->opened_ = true;
+}
+
+// ============================================================================
+// getImage()：取一帧，组装成 FromData 推给检测线程
+//   流程：收电控指令 → 读一帧 → 朝向修正 → 填入 message_
+// ============================================================================
+void UvcCamera::getImage() {
+    if (!this->opened_) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        return;
+    }
+
+    // ① 先收电控下发的指令（与海康版一致：把最新指令挂到这一帧上）
+    //    原海康版是 while 阻塞直到收到；这里保持同样语义。
+    CarData car_data;
+    while (!this->sp_.receive(car_data)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    this->message_.cd = car_data;
+
+    // ② 读一帧。read() 返回的是 BGR 三通道（OpenCV 已帮我们做完解码+色彩转换）
+    cv::Mat frame;
+    if (!this->cap_.read(frame) || frame.empty()) {
+        printf("[UvcCamera] 读帧失败（掉线或被占用）\n");
+        // 掉线自恢复：重新打开，避免整个程序卡死
+        this->cap_.release();
+        this->opened_ = false;
+        this->cap_.open(this->device_index_, cv::CAP_V4L2);
+        if (this->cap_.isOpened()) {
+            this->cap_.set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('M', 'J', 'P', 'G'));
+            this->cap_.set(cv::CAP_PROP_FRAME_WIDTH,  this->req_width_);
+            this->cap_.set(cv::CAP_PROP_FRAME_HEIGHT, this->req_height_);
+            this->cap_.set(cv::CAP_PROP_FPS,          this->req_fps_);
+            this->opened_ = true;
+            printf("[UvcCamera] 重连成功\n");
+        }
+        return;
+    }
+
+    // ③ 时间戳取"取到帧"的当前时刻
+    //    （UVC 驱动不给硬件曝光时间，只能用读取时刻近似，与海康版的处理一致）
+    this->message_.timestamp = function::getNowTimestamp();
+
+    // ④ 【朝向修正】—— 这一步必须按你的实际安装方式定，不能照抄
+    //    海康版原来是：transpose + flip(-1) + flip(1)，实测等价于"旋转90°+镜像"，
+    //    那是针对它当时的机械安装角度做的。换成 UVC 摄像头后，安装角度变了，
+    //    所以这里用 orientation_ 参数控制，你在调试窗口里看哪个方向对就填哪个：
+    //       0 = 不动
+    //       1 = 旋转 90°  顺时针   （等价原海康那三步的效果，先试这个）
+    //       2 = 旋转 180°
+    //       3 = 旋转 270° 顺时针
+    //       4 = 只做水平镜像
+    //       5 = 只做垂直镜像
+    switch (this->orientation_) {
+        case 1:
+            cv::rotate(frame, frame, cv::ROTATE_90_CLOCKWISE);
+            break;
+        case 2:
+            cv::rotate(frame, frame, cv::ROTATE_180);
+            break;
+        case 3:
+            cv::rotate(frame, frame, cv::ROTATE_90_COUNTERCLOCKWISE);
+            break;
+        case 4:
+            cv::flip(frame, frame, 1);      // 1 = 水平镜像
+            break;
+        case 5:
+            cv::flip(frame, frame, 0);      // 0 = 垂直镜像
+            break;
+        default:
+            break;                          // 0 = 保持原样
+    }
+
+    // ⑤ 存进 message_（clone 一下，避免和 VideoCapture 的内部缓冲共享内存）
+    this->message_.img = frame.clone();
+}
+
+// ============================================================================
+// 以下两个是 BaseCamera 要求的纯虚接口，UVC 用不上，留空实现
+// ============================================================================
+void UvcCamera::cameraModeChange(int now_mode, int my_color) {
+    // 海康版用它在红/蓝方之间切换曝光；UVC 摄像头没有这个接口。
+    // 如果实测发现曝光不合适，用命令行调（见文末说明）或下面的 OpenCV 接口：
+    //   this->cap_.set(cv::CAP_PROP_AUTO_EXPOSURE, 0.25);  // 关自动曝光（各家取值不同）
+    //   this->cap_.set(cv::CAP_PROP_EXPOSURE, 100.0);      // 手动曝光值
+    (void)now_mode;
+    (void)my_color;
+}
+
+void UvcCamera::assertSuccess(uint32_t status) {
+    (void)status;
+}
+
+// ============================================================================
+// 【附】如果要用命令行调曝光/增益（UVC 通用做法，比 OpenCV 的接口靠谱）
+//   v4l2-ctl -d /dev/video0 --list-ctrls              # 列出所有可调项
+//   v4l2-ctl -d /dev/video0 --set-ctrl=auto_exposure=1
+//   v4l2-ctl -d /dev/video0 --set-ctrl=exposure_time_absolute=100
+//   v4l2-ctl -d /dev/video0 --set-ctrl=gain=10
+// 注意：不同摄像头的 ctrl 名字不一样，先 --list-ctrls 看。
+// ============================================================================

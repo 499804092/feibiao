@@ -1,0 +1,744 @@
+// ============================================================================
+// uvc_detect_view.cpp —— 打开摄像头 + 实时目标检测 + 画面显示（带检测框）
+// ----------------------------------------------------------------------------
+// 这个程序把"相机取图"和"模型推理"串起来，直接在画面上画检测框，
+// 用来肉眼确认：模型到底能不能认出你要找的目标（比如绿色引导灯）。
+//
+// 【它跑的就是工程里的那条链路】
+//   相机取图(640x480, MJPG)
+//     → letterBox 缩放到网络输入(640x384 画布)
+//     → 模型推理（预处理 BGR→RGB、/255，与 OpenvinoInfer 一致）
+//     → 取 output[0]，形状 (1,15120,27)
+//     → 解析 4(框) + 9(类别) + 4(颜色)
+//     → 把框画回原图
+//
+// 【用法】
+//   ./uvc_detect_view                                  # 默认模型路径 + /dev/video0
+//   ./uvc_detect_view --no-model                       # 只看画面，不跑检测
+//   ./uvc_detect_view --thr 0.3                        # 调低检测阈值
+//   ./uvc_detect_view --orientation 2                   # 画面朝向修正(0~5)
+//   ./uvc_detect_view --headless --seconds 20           # 无窗口，只统计并打印
+//   ./uvc_detect_view --xml a.xml --bin a.bin           # 指定模型
+//
+// 【曝光调参 —— 新增】
+//   默认会从 Vision_Code/config/json/sensors.json 的 uvc.exposure 读曝光设置，
+//   所以配置里改了值，这里不用加任何参数就直接生效（和工程 Dart 行为一致）。
+//   ./uvc_detect_view --list-ctrls                      # 只列出相机可调项和范围，不打开画面
+//   ./uvc_detect_view --orientation 2 --thr 0.20        # 用 sensors.json 里的曝光值
+//   ./uvc_detect_view --auto-exp 1 --exposure 80        # 手动曝光 80（越小越暗、噪声越少）
+//   ./uvc_detect_view --no-cfg                          # 忽略配置，用相机当前状态
+//   ./uvc_detect_view --config 别的.json                # 换一个配置文件读
+//   优先级：命令行参数 > 配置文件
+//
+// 【键盘】q/ESC 退出 | s 存图 | o 切换朝向 | i 打印帧率 | t 调阈值
+//         [  ]  曝光 -10 / +10（自动切到手动模式）
+//         -  =  增益 -1  / +1
+//         a      在「自动曝光 / 手动曝光」之间切换
+//         c      打印相机全部可调项与范围（调参前先看这个）
+// ============================================================================
+
+#include <opencv2/opencv.hpp>
+#include <openvino/openvino.hpp>
+#include <cstdio>
+#include <cstring>
+#include <cstdlib>
+#include <string>
+#include <vector>
+#include <algorithm>
+#include <thread>
+#include <atomic>
+#include <chrono>
+
+// 【新增】V4L2 控制项读写（与工程 UvcCamera 用的是同一个头文件，保证行为一致）
+//   放在 sensors/inc/uvc/ 下，这里用相对路径引过来，避免还要改编译脚本的 -I
+#include "../Vision_Code/src/sensors/inc/uvc/V4l2Ctrl.hpp"
+
+// ============================================================================
+// 【新增】出流看门狗 —— 专治「一打开相机就卡死」
+// ----------------------------------------------------------------------------
+// 为什么需要：cv::VideoCapture::read() 在「相机打开了但一帧都不来」时会
+// **无限阻塞**（OpenCV 的 V4L2 后端内部 select() 没有超时）。
+// 表现就是窗口不出现、终端没输出，看起来像卡死 —— 用户完全不知道发生了什么。
+//
+// 这里起一个后台线程盯着：如果 N 秒内一帧都没读到，就打印明确的排查步骤
+// 然后直接退出，而不是让人对着一个假死的窗口发呆。
+//
+// 注意用 _exit() 而不是 exit()：从工作线程里调 exit() 会触发静态对象析构，
+// 在相机状态异常时实测会段错误（这个坑之前踩过）。
+// ============================================================================
+static std::atomic<bool> g_got_frame{false};
+
+static void streamWatchdog(int dev, int timeout_s) {
+    for (int i = 0; i < timeout_s * 10; ++i) {
+        if (g_got_frame.load()) {
+            return;                     // 已经正常出流，看门狗正常退场
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    printf("\n");
+    printf("==================================================================\n");
+    printf("❌ /dev/video%d 打开了，但 %d 秒内一帧都读不到 —— 相机没有出流\n", dev, timeout_s);
+    printf("   不是程序在算，是它卡在等一帧永远不会来的画面。\n");
+    printf("==================================================================\n");
+    printf("按顺序试，通常第 1 步就好：\n\n");
+    printf(" 1) 自动复位 USB 相机（不用重启虚拟机）：\n");
+    printf("      cd ~/Desktop/feibiao/verify\n");
+    printf("      SUDOPW=你的密码 ./recover_camera.sh\n\n");
+    printf(" 2) 不行就在 VMware 里手动重连摄像头（最可靠）：\n");
+    printf("      虚拟机 → 可移动设备 → USB 2.0 Camera → 断开连接\n");
+    printf("      等 3 秒 → 再点一次连接\n\n");
+    printf(" 3) 还不行就重启虚拟机（最彻底）。\n\n");
+    printf("【为什么会这样】按踩坑概率排序：\n");
+    printf("  a) 程序被 Ctrl+C / kill -9 强杀时正握着相机流，USB 带宽没释放\n");
+    printf("  b) 曝光设成了手动模式下过低的值 —— 本相机实测：\n");
+    printf("       手动曝光 157 能出流，40 会让流彻底起不来（固件限制）\n");
+    printf("  c) 上一次的程序没退干净，相机还被占着\n");
+    printf("     （查占用： pgrep -a -f 'uvc_|Dart'）\n");
+    printf("==================================================================\n");
+    fflush(stdout);
+    _exit(1);
+}
+
+// 与 UvcCamera.cpp 一致的朝向修正
+static cv::Mat applyOrientation(const cv::Mat &src, int mode) {
+    cv::Mat out;
+    switch (mode) {
+        case 0: out = src.clone();                                    break;
+        case 1: cv::rotate(src, out, cv::ROTATE_90_CLOCKWISE);        break;
+        case 2: cv::rotate(src, out, cv::ROTATE_180);                 break;
+        case 3: cv::rotate(src, out, cv::ROTATE_90_COUNTERCLOCKWISE); break;
+        case 4: cv::flip(src, out, 1);                                break;
+        case 5: cv::flip(src, out, 0);                                break;
+        default: out = src.clone();                                   break;
+    }
+    return out;
+}
+
+// 与 OpenvinoInfer::letterBox 一致：等比缩放 + 灰底居中，返回画布
+static void letterBox(const cv::Mat &src, cv::Mat &dst, double &scale, int &dx, int &dy,
+                      const cv::Size &dst_size) {
+    int w = src.cols, h = src.rows;
+    double r = std::min((double)dst_size.width / w, (double)dst_size.height / h);
+    int new_w = (int)(w * r), new_h = (int)(h * r);
+    cv::Mat resized;
+    cv::resize(src, resized, cv::Size(new_w, new_h), cv::INTER_CUBIC);
+    dst = cv::Mat(dst_size, CV_8UC3, cv::Scalar(128, 128, 128));
+    dx = (int)((dst_size.width - new_w) / 2.);
+    dy = (int)((dst_size.height - new_h) / 2.);
+    resized.copyTo(dst(cv::Rect(dx, dy, new_w, new_h)));
+    scale = r;
+}
+
+// 每个类别给一个固定颜色，方便肉眼区分
+static cv::Scalar classColor(int id) {
+    static const cv::Scalar tab[10] = {
+        {255, 255, 255}, {255, 128, 0}, {0, 165, 255}, {0, 0, 255}, {255, 0, 255},
+        {255, 255, 0}, {0, 255, 255}, {128, 0, 255}, {0, 255, 0},   {255, 0, 0}
+    };
+    return tab[(id >= 0 && id < 10) ? id : 0];
+}
+
+struct Det {
+    int cls;
+    float score;
+    float obj;
+    cv::Rect2d box;
+    cv::Point2d center;      // 加权质心（合并后才有意义；单个框时等于框中心）
+};
+
+// ============================================================================
+// detectFrame() —— 在【任意尺寸】的图/帧上跑完整检测链，返回原图坐标系的框
+// ----------------------------------------------------------------------------
+// 把检测流程抽出来共用，图片模式和实时相机模式走的是**同一套代码**，
+// 保证"图片能识别的，实时也一定能识别"。
+//
+// 流程与工程 OpenvinoInfer::infer 一一对应：
+//   ① letterBox 缩放到网络输入(640x384 画布)
+//   ② 推理
+//   ③ 双阈值筛选：min_objectness 粗筛 + class_threshold 卡类别
+//   ④ 只保留 TARGET_CLASS_ID 类
+//   ⑤ NMS(IoU=nms_iou) 去重
+//   ⑥ 重叠框合并（mergeOverlaps）
+//   ⑦ fitRec 坐标还原回原图坐标系
+// ============================================================================
+static const int TARGET_CLASS = 8;      // 目标类别（绿色引导灯，已实测确认）
+
+static std::vector<Det> detectFrame(ov::InferRequest &req, const cv::Mat &img,
+                                    double min_obj, double cls_thr, double nms_iou,
+                                    cv::Size net_wh) {
+    std::vector<Det> dets;
+    if (img.empty()) return dets;
+
+    cv::Mat canvas; double sc; int dx, dy;
+    letterBox(img, canvas, sc, dx, dy, net_wh);
+
+    ov::Tensor t(ov::element::u8,
+                 {1, (size_t)canvas.rows, (size_t)canvas.cols, 3}, canvas.data);
+    req.set_input_tensor(t);
+    req.infer();
+
+    const auto &out = req.get_output_tensor(0);
+    const float *data = out.data<const float>();
+    ov::Shape sh = out.get_shape();
+    size_t N = sh[1], C = sh[2];
+
+    // 画布坐标 → 原图坐标（与工程 fitRec 同一套公式）
+    double s = std::max((double)img.cols / net_wh.width,
+                        (double)img.rows / net_wh.height);
+
+    std::vector<cv::Rect>  nms_boxes;
+    std::vector<float>     nms_scores;
+    std::vector<Det>       cands;
+
+    for (size_t i = 0; i < N; ++i) {
+        const float *d = &data[i * C];
+        float obj = d[4];
+        if (obj < min_obj) continue;                  // ③ 粗筛
+        int best = -1; float bestv = 0.f;
+        for (int c = 0; c < 9; ++c) if (d[5 + c] > bestv) { bestv = d[5 + c]; best = c; }
+        if (bestv < cls_thr) continue;                // ③ 类别阈值
+        if (best != TARGET_CLASS) continue;           // ④ 只留目标类
+
+        double cx = (d[0] - net_wh.width  / 2.0) * s + img.cols / 2.0;
+        double cy = (d[1] - net_wh.height / 2.0) * s + img.rows / 2.0;
+        double bw = d[2] * s, bh = d[3] * s;
+        cv::Rect2d r(cx - bw / 2, cy - bh / 2, bw, bh);
+        r &= cv::Rect2d(0, 0, img.cols, img.rows);
+        if (r.width < 2 || r.height < 2) continue;
+
+        cands.push_back({best, bestv, obj, r, cv::Point2d(cx, cy)});
+        nms_boxes.emplace_back((int)r.x, (int)r.y, (int)r.width, (int)r.height);
+        nms_scores.push_back(obj);
+    }
+
+    // ⑤ NMS
+    std::vector<int> keep;
+    if (!nms_boxes.empty())
+        cv::dnn::NMSBoxes(nms_boxes, nms_scores, (float)min_obj, (float)nms_iou, keep);
+    for (int k : keep) dets.push_back(cands[k]);
+
+    // ⑥ 重叠框合并（与工程 mergeOverlaps 同一套逻辑）
+    if (dets.size() > 1) {
+        std::vector<bool> used(dets.size(), false);
+        std::vector<Det> merged;
+        for (size_t i = 0; i < dets.size(); ++i) {
+            if (used[i]) continue;
+            used[i] = true;
+            std::vector<size_t> grp{i};
+            for (size_t j = i + 1; j < dets.size(); ++j) {
+                if (used[j]) continue;
+                for (size_t k : grp) {
+                    double ddx = dets[j].center.x - dets[k].center.x;
+                    double ddy = dets[j].center.y - dets[k].center.y;
+                    double dist = std::sqrt(ddx * ddx + ddy * ddy);
+                    double ref = std::max(std::max(dets[k].box.width, dets[k].box.height),
+                                          std::max(dets[j].box.width, dets[j].box.height));
+                    if (ref > 1. && dist < 1.5 * ref) { used[j] = true; grp.push_back(j); break; }
+                }
+            }
+            double wsum = 0, cx = 0, cy = 0, bs = 0;
+            double x1 = 1e18, y1 = 1e18, x2 = -1e18, y2 = -1e18;
+            for (size_t k : grp) {
+                double w = std::max(1e-6, (double)dets[k].score);
+                wsum += w; cx += dets[k].center.x * w; cy += dets[k].center.y * w;
+                bs = std::max(bs, (double)dets[k].score);
+                x1 = std::min(x1, (double)dets[k].box.x);
+                y1 = std::min(y1, (double)dets[k].box.y);
+                x2 = std::max(x2, (double)(dets[k].box.x + dets[k].box.width));
+                y2 = std::max(y2, (double)(dets[k].box.y + dets[k].box.height));
+            }
+            Det m;
+            m.cls = dets[grp[0]].cls;
+            m.score = (float)bs;
+            m.obj = dets[grp[0]].obj;
+            m.box = cv::Rect2d(x1, y1, x2 - x1, y2 - y1);
+            m.center = cv::Point2d(cx / wsum, cy / wsum);
+            merged.push_back(m);
+        }
+        dets = merged;
+    }
+
+    return dets;   // ⑦ 坐标已在原图坐标系
+}
+
+// 把检测框画到图上（缩放系数用来适配小窗口显示）
+static void drawDets(cv::Mat &img, const std::vector<Det> &dets, double font_scale = 0.6) {
+    for (const auto &dt : dets) {
+        cv::Scalar col = classColor(dt.cls);
+        cv::rectangle(img, dt.box, col, 2);
+        // 画面正中心画十字准星，方便看目标是偏左还是偏右
+        char txt[160];
+        snprintf(txt, sizeof(txt), "cls%d  cls_score=%.3f  obj=%.2f",
+                 dt.cls, dt.score, dt.obj);
+        int ty = std::max((int)(font_scale * 22), (int)dt.box.y - 6);
+        cv::putText(img, txt, cv::Point((int)dt.box.x, ty),
+                    cv::FONT_HERSHEY_SIMPLEX, font_scale, col, 2);
+        cv::circle(img, dt.center, 5, col, -1);              // 加权质心
+        cv::circle(img, dt.center, 7, cv::Scalar(255, 255, 255), 1);
+    }
+}
+
+int main(int argc, char **argv) {
+    std::string xml = "/home/rsve/Desktop/feibiao/Vision_Code/config/openvino/Katrin.xml";
+    std::string bin = "/home/rsve/Desktop/feibiao/Vision_Code/config/openvino/Katrin.bin";
+    std::string img_path;         // --img <文件>：单张图片模式
+    std::string out_path;         // --out  <文件>：结果保存到哪里
+    double thr = 0.25;            // 检测阈值：故意放低，先"看到"再决定卡多少
+    int orient = 2;               // 用户实测"测试2是正的"
+    bool headless = false, no_model = false;
+    int seconds = 20, dev = 0, W = 640, H = 480, FPS = 120;
+
+    // ---- 【新增】曝光相关命令行参数 ----
+    bool list_ctrls = false;      // --list-ctrls：只列相机可调项，不开画面
+    int  exp_auto   = -1;         // --auto-exp  <n>：V4L2 auto_exposure（1=手动 3=自动）
+    int  exp_value  = -1;         // --exposure  <n>：手动曝光绝对值（100µs 为单位）
+    int  exp_gain   = -1;         // --gain      <n>：增益
+    int  exp_step   = 10;         // 按键调节曝光时的步进
+    std::string cfg_path =         // --config <文件>：从哪个配置文件读曝光默认值
+        "/home/rsve/Desktop/feibiao/Vision_Code/config/json/sensors.json";
+    bool no_cfg = false;           // --no-cfg：忽略配置文件里的曝光设置
+    int  stream_timeout = 10;      // --stream-timeout <秒>：等相机出流最多等多久
+    bool from_cli = false;         // 曝光值是不是命令行给的（用来打印正确来源）
+
+    for (int i = 1; i < argc; ++i) {
+        if (!strcmp(argv[i], "--headless"))     headless = true;
+        else if (!strcmp(argv[i], "--no-model")) no_model = true;
+        else if (!strcmp(argv[i], "--img") && i + 1 < argc) img_path = argv[++i];
+        else if (!strcmp(argv[i], "--out") && i + 1 < argc) out_path = argv[++i];
+        else if (!strcmp(argv[i], "--xml") && i + 1 < argc) xml = argv[++i];
+        else if (!strcmp(argv[i], "--bin") && i + 1 < argc) bin = argv[++i];
+        else if (!strcmp(argv[i], "--thr") && i + 1 < argc) thr = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--orientation") && i + 1 < argc) orient = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--seconds") && i + 1 < argc) seconds = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--device") && i + 1 < argc) dev = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--fps") && i + 1 < argc) FPS = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--list-ctrls")) list_ctrls = true;
+        else if (!strcmp(argv[i], "--auto-exp") && i + 1 < argc) { exp_auto = atoi(argv[++i]); from_cli = true; }
+        else if (!strcmp(argv[i], "--exposure") && i + 1 < argc) { exp_value = atoi(argv[++i]); from_cli = true; }
+        else if (!strcmp(argv[i], "--gain") && i + 1 < argc) { exp_gain = atoi(argv[++i]); from_cli = true; }
+        else if (!strcmp(argv[i], "--exp-step") && i + 1 < argc) exp_step = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--config") && i + 1 < argc) cfg_path = argv[++i];
+        else if (!strcmp(argv[i], "--no-cfg")) no_cfg = true;
+        else if (!strcmp(argv[i], "--stream-timeout") && i + 1 < argc) stream_timeout = atoi(argv[++i]);
+    }
+
+    // ========================================================================
+    // 【新增】从 sensors.json 读曝光默认值
+    //   为什么要读：工程 Dart 用的是 sensors.json 里的 uvc.exposure，
+    //   如果这个预览工具不读，就会出现「配置里改了、预览里没变」的困惑。
+    //   规则：命令行参数优先级 > 配置文件。命令行没给的项才用配置补上。
+    //        配置文件里 enable=0 时，整块配置都不生效（保持相机原样）。
+    // ========================================================================
+    if (!no_cfg) {
+        cv::FileStorage fs(cfg_path, cv::FileStorage::READ);
+        if (fs.isOpened()) {
+            cv::FileNode e = fs["uvc"]["exposure"];
+            if (!e.empty()) {
+                int en = 0;
+                if (!e["enable"].empty()) e["enable"] >> en;
+                if (en != 0) {
+                    int c_auto = -1, c_val = -1, c_gain = -1;
+                    if (!e["auto"].empty())  e["auto"]  >> c_auto;
+                    if (!e["value"].empty()) e["value"] >> c_val;
+                    if (!e["gain"].empty())  e["gain"]  >> c_gain;
+                    // 只有命令行没指定（仍是 -1）的项，才用配置值
+                    if (exp_auto  < 0) exp_auto  = c_auto;
+                    if (exp_value < 0) exp_value = c_val;
+                    if (exp_gain  < 0) exp_gain  = c_gain;
+                    printf("从配置读到曝光: enable=1 auto=%d value=%d gain=%d  (%s)\n",
+                           c_auto, c_val, c_gain, cfg_path.c_str());
+                } else {
+                    printf("配置里 uvc.exposure.enable=0 → 不调整曝光（保持相机默认）\n");
+                }
+            } else {
+                printf("配置里没有 uvc.exposure 节点 → 不调整曝光\n");
+            }
+        } else {
+            printf("读不到配置文件 %s → 不调整曝光（可用 --exposure 直接指定）\n", cfg_path.c_str());
+        }
+        // 命令行参数依然优先，冲突时以命令行为准并提示
+        if (from_cli && (exp_auto >= 0 || exp_value >= 0 || exp_gain >= 0)) {
+            printf("（命令行参数优先于配置文件）\n");
+        }
+    }
+
+    // ========================================================================
+    // 【新增】--list-ctrls：只打开控制通道，把相机能调的东西列出来就退出。
+    //   用途：手动调曝光之前先看这台相机到底支持什么、范围是多少。
+    //   注意：这里不做取流，所以非常安全，也不会把相机"占住"。
+    // ========================================================================
+    if (list_ctrls) {
+        printf("============== 相机可调项一览 ==============\n");
+        int fd = v4l2ctrl::openDevice(dev);
+        if (fd < 0) {
+            printf("❌ 打不开 /dev/video%d\n", dev);
+            printf("   先确认摄像头已挂给虚拟机： v4l2-ctl --list-devices\n");
+            return 1;
+        }
+        printf("设备: /dev/video%d\n\n", dev);
+        v4l2ctrl::printAllRelevant(fd);
+        printf("\n读取到的当前值就是相机此刻真实的状态。\n");
+        printf("调手动曝光的正确顺序（顺序反了驱动会忽略）：\n");
+        printf("  先 auto_exposure=1 切手动，再写 exposure_time_absolute\n\n");
+        v4l2ctrl::closeDevice(fd);
+        return 0;
+    }
+
+    printf("============== 相机 + 实时检测 ==============\n");
+
+    // ---------------- 载入模型 ----------------
+    ov::Core core;
+    ov::CompiledModel compiled;
+    ov::InferRequest req;
+    bool has_model = false;
+    cv::Size net_wh(640, 384);
+
+    if (!no_model) {
+        try {
+            auto model = core.read_model(xml, bin);
+            ov::preprocess::PrePostProcessor ppp(model);
+            ppp.input().tensor()
+                .set_element_type(ov::element::u8)
+                .set_layout("NHWC")
+                .set_color_format(ov::preprocess::ColorFormat::BGR);
+            ppp.input().preprocess()
+                .convert_element_type(ov::element::f32)
+                .convert_color(ov::preprocess::ColorFormat::RGB)
+                .scale({255.f, 255.f, 255.f});
+            ppp.input().model().set_layout("NCHW");
+            for (int i = 0; i < 3; ++i) ppp.output(i).tensor().set_element_type(ov::element::f32);
+            model = ppp.build();
+            compiled = core.compile_model(model, "CPU");
+            req = compiled.create_infer_request();
+            has_model = true;
+            printf("模型已载入: %s\n", xml.c_str());
+        } catch (const std::exception &e) {
+            printf("⚠️ 模型载入失败，改为只显示画面: %s\n", e.what());
+        }
+    } else {
+        printf("--no-model：只显示画面，不跑检测\n");
+    }
+
+    // ========================================================================
+    // 【新增】图片模式：--img <文件>  对单张图片检测并画框，不需要相机
+    //   用途：把目标照片放进 feibiao 文件夹，直接看框画得准不准
+    // ========================================================================
+    if (!img_path.empty()) {
+        if (!has_model) { printf("❌ 图片模式必须载入模型\n"); return 1; }
+
+        cv::Mat img = cv::imread(img_path);
+        if (img.empty()) { printf("❌ 读不到图片: %s\n", img_path.c_str()); return 1; }
+        printf("\n图片: %s\n尺寸: %d 列 x %d 行\n", img_path.c_str(), img.cols, img.rows);
+
+        std::vector<Det> dets = detectFrame(req, img, thr, thr, 0.25, net_wh);
+
+        printf("\n---------------- 检测结果 ----------------\n");
+        printf("阈值: min_objectness=%.2f  class_threshold=%.2f  nms_iou=0.25\n", thr, thr);
+        printf("检出目标数: %zu\n\n", dets.size());
+        if (dets.empty()) {
+            printf("❌ 没检测到目标。可以试着把阈值调低： --thr 0.15\n");
+        }
+        for (size_t i = 0; i < dets.size(); ++i) {
+            const Det &d = dets[i];
+            printf("  目标 %zu:\n", i + 1);
+            printf("    类别        : 第 %d 类%s\n", d.cls,
+                   d.cls == TARGET_CLASS ? "  (目标类，正确)" : "  (!不是目标类)");
+            printf("    类别得分    : %.3f      <- 模型有多确定【这是引导灯】\n", d.score);
+            printf("    objectness  : %.2f      <- 模型有多确定【这里有东西】\n", d.obj);
+            printf("    框(原图坐标): x=%.0f y=%.0f w=%.0f h=%.0f\n",
+                   d.box.x, d.box.y, d.box.width, d.box.height);
+            printf("    中心(原图)  : (%.0f, %.0f)\n", d.center.x, d.center.y);
+            printf("    中心相对画面: %.1f%% 横向, %.1f%% 纵向   (50%% 就是正中心)\n",
+                   100.0 * d.center.x / img.cols, 100.0 * d.center.y / img.rows);
+        }
+
+        // 画框并保存
+        drawDets(img, dets, 0.8);
+        std::string save = out_path.empty() ? "detect_result.jpg" : out_path;
+        cv::imwrite(save, img);
+        printf("\n已保存标注结果: %s\n", save.c_str());
+        printf("（可以直接打开这张图看框画得准不准）\n");
+        printf("------------------------------------------\n");
+        return 0;
+    }
+
+    // ---------------- 打开相机 ----------------
+    printf("\n>>> 正在打开相机... 如果 %d 秒内没有画面会自动报错退出（不会假死）\n",
+           stream_timeout);
+    fflush(stdout);
+
+    cv::VideoCapture cap(dev, cv::CAP_V4L2);
+    if (!cap.isOpened()) { printf("❌ 打不开 /dev/video%d\n", dev); return 1; }
+    cap.set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('M', 'J', 'P', 'G'));
+    cap.set(cv::CAP_PROP_FRAME_WIDTH, W);
+    cap.set(cv::CAP_PROP_FRAME_HEIGHT, H);
+    cap.set(cv::CAP_PROP_FPS, FPS);
+    cap.set(cv::CAP_PROP_BUFFERSIZE, 1);
+    printf("相机: /dev/video%d  实际 %dx%d @%.0f\n", dev,
+           (int)cap.get(cv::CAP_PROP_FRAME_WIDTH), (int)cap.get(cv::CAP_PROP_FRAME_HEIGHT),
+           cap.get(cv::CAP_PROP_FPS));
+    printf("朝向修正: %d    检测阈值: %.2f\n", orient, thr);
+
+    // ========================================================================
+    // 【新增】曝光通道
+    //   单独开一个 fd 专发 V4L2 控制命令（和 OpenCV 的取流句柄互不干扰）。
+    //   没有传任何曝光参数时，这里只是把当前值读出来显示，一个字节都不写。
+    // ========================================================================
+    int ctrl_fd = v4l2ctrl::openDevice(dev);
+    if (ctrl_fd < 0) {
+        printf("⚠️ 打不开控制通道，曝光调节不可用（取流不受影响）\n");
+    } else {
+        // 给了参数就先下发（顺序：先切模式，再写曝光值）
+        if (exp_auto >= 0 || exp_value >= 0 || exp_gain >= 0) {
+            printf("\n>>> 设置曝光（%s）<<<\n", from_cli ? "来自命令行参数" : "来自配置文件");
+            if (exp_auto >= 0) {
+                printf("  %s auto_exposure -> %d\n",
+                       v4l2ctrl::set(ctrl_fd, V4L2_CID_EXPOSURE_AUTO, exp_auto) ? "✓" : "✗", exp_auto);
+                // ★ 不要动 auto_priority！
+                //   实测把它设成 0 会让 640x480 MJPG 取流起不来（相机只支持
+                //   0.008s 这一档帧间隔，驱动按曝光反推出来的间隔不被支持）。
+            }
+            if (exp_value >= 0) {
+                if (exp_auto == V4L2_EXPOSURE_MANUAL || exp_auto < 0) {
+                    printf("  %s exposure_time_absolute -> %d\n",
+                           v4l2ctrl::set(ctrl_fd, V4L2_CID_EXPOSURE_ABSOLUTE, exp_value) ? "✓" : "✗",
+                           exp_value);
+                    // ★ 警告：写进去了不等于相机能出流
+                    if (exp_value < 157) {
+                        printf("  ⚠️ 注意：本相机手动曝光低于 157 时【画面会完全出不来】\n");
+                        printf("     （实测 40 会让取流彻底失败，需要重连相机才能恢复）\n");
+                        printf("     如果接下来卡住，请跑 ./recover_camera.sh\n");
+                    }
+                } else {
+                    printf("  ⚠️ auto_exposure=%d 不是手动(1)，驱动会忽略曝光值 %d\n",
+                           exp_auto, exp_value);
+                }
+            }
+            if (exp_gain >= 0) {
+                printf("  %s gain -> %d\n",
+                       v4l2ctrl::set(ctrl_fd, V4L2_CID_GAIN, exp_gain) ? "✓" : "✗", exp_gain);
+            }
+        }
+        // 读回真实值显示（不管有没有设过都显示，方便知道起点在哪）
+        int a = -1, v = -1, g = -1;
+        v4l2ctrl::get(ctrl_fd, V4L2_CID_EXPOSURE_AUTO,     a);
+        v4l2ctrl::get(ctrl_fd, V4L2_CID_EXPOSURE_ABSOLUTE, v);
+        v4l2ctrl::get(ctrl_fd, V4L2_CID_GAIN,              g);
+        printf("当前曝光: auto_exposure=%d (%s)  exposure_time_absolute=%d  gain=%d\n",
+               a, a == V4L2_EXPOSURE_MANUAL ? "手动" : (a == 3 ? "自动" : "其它"), v, g);
+    }
+
+    printf("\n>>> 把目标（绿色引导灯）对准镜头 <<<\n\n");
+    fflush(stdout);
+
+    // ========================================================================
+    // 【关键】启动出流看门狗，然后再开始读帧
+    //   从这一行起，任何 read() 长时间拿不到帧，都会在 stream_timeout 秒后
+    //   打印排查步骤并退出，绝不会出现"假死"。
+    // ========================================================================
+    std::thread(streamWatchdog, dev, stream_timeout).detach();
+
+    cv::Mat frame;
+    for (int i = 0; i < 10; ++i) cap.read(frame);
+
+    double t0 = (double)cv::getTickCount();
+    long frames = 0, infer_cnt = 0;
+    double last_report = 0.0;
+    int tick = 0;
+
+    // 【新增】曝光状态缓存（界面显示用；每 15 帧才去问一次相机，别每帧都发 ioctl）
+    int cur_auto = -1, cur_exp = -1, cur_gain = -1;
+
+    // 【新增】读帧失败计数 + 起帧超时保护
+    //   为什么要这个：摄像头被别的进程占用时，cap.read() 会一直失败但**不抛异常**，
+    //   程序就无声地空转，看起来像"卡住"（你之前遇到的就是这个）。
+    //   这里连续失败够多次就明确报错并退出，而不是傻等。
+    int fail_cnt = 0;
+    const int FAIL_LIMIT = 60;          // 连续 60 次读不到帧就放弃（约 1~2 秒）
+
+    // 启动阶段也检查一下：连第一帧都读不到，说明设备被占用或没出流
+    {
+        cv::Mat probe;
+        if (!cap.read(probe) || probe.empty()) {
+            printf("\n❌ 连第一帧都读不到 —— 摄像头没有出流。\n");
+            printf("   最常见原因：① 相机被别的进程占用  ② USB 相机状态卡住\n");
+            printf("   解决办法：\n");
+            printf("     cd ~/Desktop/feibiao/verify\n");
+            printf("     SUDOPW=你的密码 ./recover_camera.sh   # 自动复位 USB 相机\n");
+            printf("   还不行就在 VMware 里把摄像头【断开】再【重新连接】，或重启虚拟机。\n\n");
+            fflush(stdout);
+            _exit(1);
+        }
+        frame = probe;
+    }
+    g_got_frame.store(true);            // 出流正常，看门狗可以退场了
+
+    if (headless) {
+        printf("headless 模式，跑 %d 秒\n", seconds);
+    } else {
+        printf("按键: q/ESC 退出 | s 存图 | o 切朝向 | i 帧率 | t 调阈值\n");
+        printf("      [ ] 曝光 -%d/+%d（自动切手动）| - = 增益 -1/+1 | a 自动/手动切换 | c 列出可调项\n",
+               exp_step, exp_step);
+    }
+
+    while (true) {
+        if (!cap.read(frame) || frame.empty()) {
+            // 读不到帧：不立刻退出，先容忍几次瞬断；连续失败太多才报错退出
+            if (++fail_cnt >= FAIL_LIMIT) {
+                printf("\n❌ 连续 %d 次读不到帧 —— 摄像头掉线或被其他进程占用。\n", fail_cnt);
+                printf("   请跑清理脚本： cd ~/Desktop/feibiao/verify && ./fix_camera.sh\n");
+                break;
+            }
+            if (fail_cnt == 10) {         // 第一次提醒
+                printf("⚠️ 读帧失败中... 如果一直这样，可能是摄像头被别的进程占用了\n");
+                printf("   （另开一个终端跑 ./fix_camera.sh 可自动清理）\n");
+            }
+            cv::waitKey(10);
+            continue;
+        }
+        fail_cnt = 0;                     // 读到帧就清零
+        ++frames;
+
+        cv::Mat shown = applyOrientation(frame, orient);
+
+        std::vector<Det> dets;
+        if (has_model && ++tick % 2 == 0) {          // 隔帧推理，画面更流畅
+            // ★ 与图片模式调用的是同一个函数，保证两条路行为一致 ★
+            dets = detectFrame(req, shown, thr, thr, 0.25, net_wh);
+            ++infer_cnt;
+        }
+
+        // ---------------- 画框 ----------------
+        drawDets(shown, dets, 0.6);
+        // 画面正中心画十字准星，方便看目标是偏左还是偏右
+        cv::line(shown, cv::Point(shown.cols / 2, shown.rows / 2 - 20),
+                 cv::Point(shown.cols / 2, shown.rows / 2 + 20), cv::Scalar(255, 255, 255), 1);
+        cv::line(shown, cv::Point(shown.cols / 2 - 20, shown.rows / 2),
+                 cv::Point(shown.cols / 2 + 20, shown.rows / 2), cv::Scalar(255, 255, 255), 1);
+
+        // ---------------- 叠加状态栏 ----------------
+        double el = ((double)cv::getTickCount() - t0) / cv::getTickFrequency();
+        double fps = el > 0.5 ? frames / el : 0.0;
+        cv::rectangle(shown, cv::Rect(0, 0, shown.cols, 38), cv::Scalar(0, 0, 0), -1);
+        char bar[256];
+        snprintf(bar, sizeof(bar), "%.1ffps orient=%d thr=%.2f det=%zu %s",
+                 fps, orient, thr, dets.size(), has_model ? "" : "(no model)");
+        cv::putText(shown, bar, cv::Point(8, 27), cv::FONT_HERSHEY_SIMPLEX, 0.66,
+                    cv::Scalar(0, 255, 255), 2);
+
+        // ---------------- 【新增】曝光状态栏（第二行）----------------
+        //   只每 15 帧读一次相机，避免每帧都发 ioctl 拖慢帧率
+        if (ctrl_fd >= 0 && (frames % 15) == 0) {
+            v4l2ctrl::get(ctrl_fd, V4L2_CID_EXPOSURE_AUTO,     cur_auto);
+            v4l2ctrl::get(ctrl_fd, V4L2_CID_EXPOSURE_ABSOLUTE, cur_exp);
+            v4l2ctrl::get(ctrl_fd, V4L2_CID_GAIN,              cur_gain);
+        }
+        if (ctrl_fd >= 0) {
+            char bar2[256];
+            // 顺便把画面平均亮度显示出来 —— 调曝光时直接看这个数字最直观
+            cv::Scalar mean_bgr = cv::mean(shown);
+            double mean_lum = (mean_bgr[0] + mean_bgr[1] + mean_bgr[2]) / 3.0;
+            snprintf(bar2, sizeof(bar2), "exp %s=%d gain=%d | 画面平均亮度=%.0f  [ ]调曝光 - =调增益 a切模式 c列项",
+                     cur_auto == V4L2_EXPOSURE_MANUAL ? "手动" : (cur_auto == 3 ? "自动" : "其它"),
+                     cur_exp, cur_gain, mean_lum);
+            cv::rectangle(shown, cv::Rect(0, 38, shown.cols, 30), cv::Scalar(0, 0, 0), -1);
+            cv::putText(shown, bar2, cv::Point(8, 60), cv::FONT_HERSHEY_SIMPLEX, 0.56,
+                        cv::Scalar(120, 255, 120), 1);
+        }
+
+        // ---------------- 输出 ----------------
+        if (headless) {
+            if (el - last_report >= 1.0) {
+                last_report = el;
+                printf("[%5.1fs] %5.1ffps  检测到 %zu 个目标", el, fps, dets.size());
+                if (!dets.empty()) {
+                    printf("  →");
+                    for (auto &dt : dets)
+                        printf(" [第%d类 得分%.2f obj%.2f 中心(%.0f,%.0f) %.0fx%.0f]",
+                               dt.cls, dt.score, dt.obj,
+                               dt.box.x + dt.box.width / 2, dt.box.y + dt.box.height / 2,
+                               dt.box.width, dt.box.height);
+                }
+                printf("\n");
+                fflush(stdout);
+            }
+            if (el >= seconds) break;
+        } else {
+            cv::imshow("UVC detect (q=quit s=save o=orient t=thr [ ]=exposure)", shown);
+            int key = cv::waitKey(1) & 0xFF;
+            if (key == 'q' || key == 27) break;
+            else if (key == 's') { cv::imwrite("detect_shot.png", shown); printf("已存 detect_shot.png\n"); }
+            else if (key == 'o') { orient = (orient + 1) % 6; printf("朝向 -> %d\n", orient); }
+            else if (key == 'i') { printf("%.1f fps\n", fps); }
+            else if (key == 't') { thr = thr > 0.4 ? 0.15 : thr + 0.05; printf("阈值 -> %.2f\n", thr); }
+            // ---------------- 【新增】曝光调节按键 ----------------
+            else if (key == '[' || key == ']' || key == '-' || key == '=' || key == 'a' || key == 'c') {
+                if (ctrl_fd < 0) {
+                    printf("⚠️ 控制通道没打开，曝光调节不可用\n");
+                } else if (key == 'c') {
+                    // 列出这台相机所有可调项与范围（调参前先看这个）
+                    printf("\n---- /dev/video%d 可调项 ----\n", dev);
+                    v4l2ctrl::printAllRelevant(ctrl_fd);
+                    printf("----------------------------\n\n");
+                } else if (key == 'a') {
+                    // 自动 / 手动 来回切
+                    // ★ 注意：不要动 exposure_auto_priority，把它设成 0 会让
+                    //   640x480 MJPG 取流起不来（相机只支持 0.008s 这一档帧间隔）
+                    int now = -1;
+                    v4l2ctrl::get(ctrl_fd, V4L2_CID_EXPOSURE_AUTO, now);
+                    int nxt = (now == V4L2_EXPOSURE_MANUAL) ? 3 : V4L2_EXPOSURE_MANUAL;
+                    v4l2ctrl::set(ctrl_fd, V4L2_CID_EXPOSURE_AUTO, nxt);
+                    printf("auto_exposure: %d -> %d (%s)\n", now, nxt,
+                           nxt == V4L2_EXPOSURE_MANUAL ? "手动" : "自动");
+                    if (nxt == V4L2_EXPOSURE_MANUAL) {
+                        printf("  ⚠️ 手动模式下曝光值低于 157 会让画面完全出不来！\n");
+                        printf("     先用 ] 把曝光调到 157 以上再往下降，边看画面边试。\n");
+                    }
+                } else {
+                    // 只要动曝光/增益，就先把模式切成手动，否则驱动会立刻覆盖掉
+                    int now = -1;
+                    v4l2ctrl::get(ctrl_fd, V4L2_CID_EXPOSURE_AUTO, now);
+                    if (now != V4L2_EXPOSURE_MANUAL) {
+                        v4l2ctrl::set(ctrl_fd, V4L2_CID_EXPOSURE_AUTO, V4L2_EXPOSURE_MANUAL);
+                        printf("（已自动切到手动曝光模式）\n");
+                    }
+                    if (key == '[' || key == ']') {
+                        int v = -1;
+                        v4l2ctrl::get(ctrl_fd, V4L2_CID_EXPOSURE_ABSOLUTE, v);
+                        if (v < 0) v = 157;
+                        // 不允许降到 157 以下 —— 实测低于这个值相机会完全出不了流
+                        int nv = v + ((key == ']') ? exp_step : -exp_step);
+                        if (nv < 157) {
+                            printf("曝光已经是下限 157 了。再低相机会直接推不出画面\n");
+                            printf("（实测 40 会让取流彻底失败，只能重连相机才能恢复）\n");
+                            printf("想更暗请改用亮度项： v4l2-ctl -d /dev/video0 --set-ctrl=brightness=-20\n");
+                            nv = 157;
+                        }
+                        bool ok = v4l2ctrl::set(ctrl_fd, V4L2_CID_EXPOSURE_ABSOLUTE, nv);
+                        int back = -1;
+                        v4l2ctrl::get(ctrl_fd, V4L2_CID_EXPOSURE_ABSOLUTE, back);
+                        printf("曝光 -> %d  (%s，实际生效 %d)\n",
+                               nv, ok ? "写入成功" : "写入失败", back);
+                    } else {
+                        int g = -1;
+                        v4l2ctrl::get(ctrl_fd, V4L2_CID_GAIN, g);
+                        if (g < 0) g = 0;
+                        g += (key == '=') ? 1 : -1;
+                        if (g < 0) g = 0;
+                        bool ok = v4l2ctrl::set(ctrl_fd, V4L2_CID_GAIN, g);
+                        int back = -1;
+                        v4l2ctrl::get(ctrl_fd, V4L2_CID_GAIN, back);
+                        printf("增益 -> %d  (%s，实际生效 %d)\n", g, ok ? "写入成功" : "写入失败", back);
+                    }
+                }
+            }
+        }
+    }
+
+    cap.release();
+    // 【新增】关掉控制通道
+    if (ctrl_fd >= 0) v4l2ctrl::closeDevice(ctrl_fd);
+    if (!headless) cv::destroyAllWindows();
+    printf("\n结束：共 %ld 帧，推理 %ld 次\n", frames, infer_cnt);
+    return 0;
+}

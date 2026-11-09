@@ -1,0 +1,51 @@
+/**
+ ******************************************************************************
+ * @file    UvcCamera.hpp
+ * @brief   UVC 免驱摄像头取图（本项目唯一的相机后端）
+ ******************************************************************************
+ * 【设计说明】
+ *   本项目使用的是「亚博智能 USB 摄像头 1080P」这类**标准 UVC 免驱摄像头**：
+ *   由 Linux 内核 uvcvideo 驱动暴露成 /dev/video*，用 OpenCV 的 cv::VideoCapture
+ *   直接读即可 —— **不需要任何厂商 SDK**。
+ *
+ *   它继承 sensors::BaseCamera，实现 cameraInit() 和 getImage() 两个纯虚函数，
+ *   所以 main.cpp 里的取图线程只需要：
+ *       UvcCamera cam(sp);
+ *       cam.cameraInit();
+ *       cam.refreshImage(fd_msgs);
+ *   下游（检测 → 跟踪 → 解算 → 串口下发）完全不受影响。
+ *
+ * 【依赖】只需 OpenCV（本机 4.5.4，已确认带 v4l/v4l2 后端）
+ ******************************************************************************
+ */
+
+#ifndef UVC_CAMERA_HPP_
+#define UVC_CAMERA_HPP_
+
+#include "sensors.hpp"          // sensors::BaseCamera（含 FromData / SerialPort 引用）
+
+class UvcCamera : public virtual sensors::BaseCamera {
+public:
+    explicit UvcCamera(SerialPort &sp);
+    ~UvcCamera();
+
+    void cameraInit() override;     // 打开设备并配置分辨率/帧率
+
+private:
+    void getImage() override;                                   // 取一帧（+ 电控指令）
+    void cameraModeChange(int now_mode, int my_color) override; // 兼容接口，未使用
+    void assertSuccess(uint32_t status) override;               // 兼容接口，未使用
+
+    // ---- 从 config/json/sensors.json 读出来的配置 ----
+    int   device_index_ = 0;        // /dev/videoN 的 N
+    int   req_width_    = 640;      // 请求的宽（要用原图尺寸，别用 1920 全图）
+    int   req_height_   = 480;      // 请求的高
+    int   req_fps_      = 120;      // 请求的帧率
+    int   orientation_  = 0;        // 【重要】画面朝向修正，见下方说明
+    bool  use_mjpg_     = true;     // true = MJPG（高帧率必须），false = YUYV
+
+    cv::VideoCapture cap_;          // OpenCV 采集对象
+    bool  opened_ = false;
+};
+
+#endif // UVC_CAMERA_HPP_

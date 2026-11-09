@@ -1,0 +1,55 @@
+{
+  "selection": {
+    "max_drop_frame": 1.0,
+    "limit_drop_frame": 1.5,
+
+    "min_found_frame": 1.0,
+    "limit_found_frame": 1.5
+  },
+
+  "euro": {
+    "min_cut_off": 0.5,
+    "beta": 0.5,
+    "d_cut_off": 0.5
+  },
+
+  "ktrack": {
+    "path": "../config/json/ktrack.json"
+  },
+
+  "camera": {
+    "fx": 1706.0,
+    "fy": 1705.1,
+    "cx": 320.0,
+    "cy": 320.0
+  },
+
+  "target": {
+    "width_m": 0.15,
+    "height_m": 0.15
+  },
+
+  "distance": {
+    "min_m": 0.5,
+    "max_m": 8.0
+  },
+
+  "choice": "82_84_88_105",
+  "group": {
+    "82_84_88_105": {
+      "0": 0,
+
+      "1": 5,
+
+      "2": -6,
+
+      "3": -4,
+
+      "4": -6
+    }
+  },
+
+  "rules": "to right: +, to left: -",
+
+  "death": -0
+}

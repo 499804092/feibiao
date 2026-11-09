@@ -1,0 +1,246 @@
+{
+	"configurations" : 
+	[
+		{
+			"directories" : 
+			[
+				{
+					"build" : ".",
+					"childIndexes" : 
+					[
+						1,
+						2,
+						3,
+						4,
+						5
+					],
+					"jsonFile" : "directory-.-Debug-f5ebdc15457944623624.json",
+					"minimumCMakeVersion" : 
+					{
+						"string" : "3.20"
+					},
+					"projectIndex" : 0,
+					"source" : ".",
+					"targetIndexes" : 
+					[
+						0
+					]
+				},
+				{
+					"build" : "src/utility",
+					"jsonFile" : "directory-src.utility-Debug-77569dd1d53133694646.json",
+					"minimumCMakeVersion" : 
+					{
+						"string" : "3.20"
+					},
+					"parentIndex" : 0,
+					"projectIndex" : 1,
+					"source" : "src/utility",
+					"targetIndexes" : 
+					[
+						5
+					]
+				},
+				{
+					"build" : "src/sensors",
+					"jsonFile" : "directory-src.sensors-Debug-73ea3c0259c6a8aa3020.json",
+					"minimumCMakeVersion" : 
+					{
+						"string" : "3.20"
+					},
+					"parentIndex" : 0,
+					"projectIndex" : 2,
+					"source" : "src/sensors",
+					"targetIndexes" : 
+					[
+						3
+					]
+				},
+				{
+					"build" : "src/detect",
+					"jsonFile" : "directory-src.detect-Debug-7e9f381551e9a6631867.json",
+					"minimumCMakeVersion" : 
+					{
+						"string" : "3.20"
+					},
+					"parentIndex" : 0,
+					"projectIndex" : 3,
+					"source" : "src/detect",
+					"targetIndexes" : 
+					[
+						1
+					]
+				},
+				{
+					"build" : "src/track",
+					"jsonFile" : "directory-src.track-Debug-edf55c9989932896889c.json",
+					"minimumCMakeVersion" : 
+					{
+						"string" : "3.20"
+					},
+					"parentIndex" : 0,
+					"projectIndex" : 4,
+					"source" : "src/track",
+					"targetIndexes" : 
+					[
+						4
+					]
+				},
+				{
+					"build" : "src/mouse",
+					"jsonFile" : "directory-src.mouse-Debug-7e08e9d33e27f051d84a.json",
+					"minimumCMakeVersion" : 
+					{
+						"string" : "3.20"
+					},
+					"parentIndex" : 0,
+					"projectIndex" : 5,
+					"source" : "src/mouse",
+					"targetIndexes" : 
+					[
+						2
+					]
+				}
+			],
+			"name" : "Debug",
+			"projects" : 
+			[
+				{
+					"childIndexes" : 
+					[
+						1,
+						2,
+						3,
+						4,
+						5
+					],
+					"directoryIndexes" : 
+					[
+						0
+					],
+					"name" : "Dart",
+					"targetIndexes" : 
+					[
+						0
+					]
+				},
+				{
+					"directoryIndexes" : 
+					[
+						1
+					],
+					"name" : "utility",
+					"parentIndex" : 0,
+					"targetIndexes" : 
+					[
+						5
+					]
+				},
+				{
+					"directoryIndexes" : 
+					[
+						2
+					],
+					"name" : "sensors",
+					"parentIndex" : 0,
+					"targetIndexes" : 
+					[
+						3
+					]
+				},
+				{
+					"directoryIndexes" : 
+					[
+						3
+					],
+					"name" : "detect",
+					"parentIndex" : 0,
+					"targetIndexes" : 
+					[
+						1
+					]
+				},
+				{
+					"directoryIndexes" : 
+					[
+						4
+					],
+					"name" : "track",
+					"parentIndex" : 0,
+					"targetIndexes" : 
+					[
+						4
+					]
+				},
+				{
+					"directoryIndexes" : 
+					[
+						5
+					],
+					"name" : "mouse",
+					"parentIndex" : 0,
+					"targetIndexes" : 
+					[
+						2
+					]
+				}
+			],
+			"targets" : 
+			[
+				{
+					"directoryIndex" : 0,
+					"id" : "Dart::@6890427a1f51a3e7e1df",
+					"jsonFile" : "target-Dart-Debug-d453aa0c2d14277a0851.json",
+					"name" : "Dart",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 3,
+					"id" : "detect::@5a573f8668a64b45fc06",
+					"jsonFile" : "target-detect-Debug-91bb68ceb77e8ba5f071.json",
+					"name" : "detect",
+					"projectIndex" : 3
+				},
+				{
+					"directoryIndex" : 5,
+					"id" : "mouse::@b09dae00c259f176f875",
+					"jsonFile" : "target-mouse-Debug-fd27ba5a93c7326439ff.json",
+					"name" : "mouse",
+					"projectIndex" : 5
+				},
+				{
+					"directoryIndex" : 2,
+					"id" : "sensors::@8d2b3ec0edc5ac3fa2bf",
+					"jsonFile" : "target-sensors-Debug-7181adb0bf814ef30a9d.json",
+					"name" : "sensors",
+					"projectIndex" : 2
+				},
+				{
+					"directoryIndex" : 4,
+					"id" : "track::@080afd618bc53dcaa7a4",
+					"jsonFile" : "target-track-Debug-2a4469a644c24c7cb32f.json",
+					"name" : "track",
+					"projectIndex" : 4
+				},
+				{
+					"directoryIndex" : 1,
+					"id" : "utility::@d11917d783b4c5ebb356",
+					"jsonFile" : "target-utility-Debug-6579ebaa7d82282df9f6.json",
+					"name" : "utility",
+					"projectIndex" : 1
+				}
+			]
+		}
+	],
+	"kind" : "codemodel",
+	"paths" : 
+	{
+		"build" : "/home/rsve/Desktop/feibiao/build",
+		"source" : "/home/rsve/Desktop/feibiao/Vision_Code"
+	},
+	"version" : 
+	{
+		"major" : 2,
+		"minor" : 3
+	}
+}

@@ -1,0 +1,26 @@
+{
+  "color": {
+    "h_min": 40,
+    "h_max": 80,
+    "s_min": 60,
+    "s_max": 255,
+    "v_min": 60,
+    "v_max": 255,
+
+    "aspect_max": 1.60,
+    "extent_min": 0.45,
+    "circularity_min": 0.0,
+    "min_area": 5,
+    "ref_area": 2000.0,
+    "max_targets": 1,
+    "morph_size": 0,
+
+    "roi_top": 0.0,
+    "roi_bottom": 1.0
+  },
+
+  "view": {
+    "enable": 1,
+    "mask": 0
+  }
+}
